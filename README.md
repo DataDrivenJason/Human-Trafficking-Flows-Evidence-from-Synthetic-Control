@@ -34,6 +34,7 @@ Randomisation inference and robustness checks indicate no statistically signific
 ```
 📁 thesis-honduras-trafficking/
 │
+├──  PDF of the Thesis 
 ├──  README.md                # Project documentation 
 ├──  thesis_summary.pdf       # Executive summary or published version
 ├──  data/                    # Raw and cleaned data files
