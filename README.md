@@ -61,13 +61,11 @@ Randomisation inference and robustness checks indicate no statistically signific
 # 🏁 Conclusion
 While the analysis does not confirm a significant causal relationship between the 2017 Honduran election crisis and U.S. trafficking flows, it contributes to the growing field of causal inference in illicit markets and highlights data and methodological challenges in human trafficking research.
 
-
-
-
-
-
-
-
+# 📜 Citation
+If you use this research, please cite as:
+```
+McGrath, J. (2025). "The Causal Effect of the 2017 Honduran Election Crisis on Human Trafficking Flows into the United States: Evidence from Synthetic Control". MSc Thesis, University College Dublin.
+```
 
 
 
