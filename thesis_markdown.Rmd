@@ -1,0 +1,981 @@
+---
+title: "Thesis"
+author: "Jason McGrath"
+date: "2025-08-17"
+output:
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r}
+library(wbstats)
+library(tidyverse)
+library(gridExtra)
+library(Synth)
+library(WDI)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(scales)
+library(stringr)
+library(tidysynth)
+library(augsynth)
+library(SCtools)
+library(purrr)
+library(forecast)
+library(tibble)
+library(knitr)
+library(kableExtra)
+
+
+
+all_data_joined <- read.csv("C:/Users/jason/OneDrive/Documents/Masters 2023/Masters Year 2/Thesis/all_data_joined.csv")
+
+```
+
+```{r}
+#Victim count by country 2017
+all_data_joined %>%
+  group_by(countryname, year) %>%
+  summarise(victim_count = sum(victim_count, na.rm = TRUE), .groups = "drop") %>%
+  filter(year >= 2005 ) %>%
+  ggplot(aes(x = year, y = victim_count, color = countryname)) +
+  geom_line(size = 1) +
+  geom_point() +
+  labs(
+    title = "Plot 1: Victim Count by Country",
+    x = "Year",
+    y = "Victim Count",
+    color = "Country"
+  ) +
+  theme_minimal()
+```
+```{r}
+# -----------------------------
+# 1) Define treatment & periods
+# -----------------------------
+
+treated_country <- "Honduras"
+treat_year      <- 2017
+pre_period      <- 2005:2016
+post_period     <- 2017:2022
+
+# -----------------------------
+# 2) Make a clean Synth dataset
+# -----------------------------
+# Use a fresh numeric id and base::data.frame (not tibble)
+d <- all_data_joined %>%
+  transmute(
+    country     = countryname,
+    year        = as.integer(year),
+    unit_num    = as.numeric(factor(countryname)),  # <- guaranteed numeric id
+    gdp_pc      = as.numeric(gdp_pc),
+    unemp       = as.numeric(unemp),
+    urban_pop   = as.numeric(urban_pop),
+    net_mig     = as.numeric(net_mig),
+    population  = as.numeric(population),
+    homicide    = as.numeric(homicide),
+    estimate    = as.numeric(estimate),
+    victim_count= as.numeric(victim_count)          # <- outcome variable
+  ) %>%
+  group_by(country) %>%
+  # impute only predictors; do NOT touch the outcome
+  mutate(across(c(gdp_pc, unemp, urban_pop, net_mig, population, homicide, estimate),
+                ~ ifelse(is.na(.), mean(.x, na.rm = TRUE), .))) %>%
+  ungroup() %>%
+  as.data.frame()
+
+# -----------------------------
+# 3) IDs and predictor selection
+# -----------------------------
+treated_id <- unique(d$unit_num[d$country == treated_country])
+donor_ids  <- setdiff(unique(d$unit_num), treated_id)
+
+predictors_vec <- c("gdp_pc","unemp","urban_pop","net_mig","population","homicide","estimate")
+
+# Keep only years we plan to use
+d_use <- d[d$year %in% c(pre_period, post_period), ]
+
+
+# Keep only lag years with variance across donors (pre-period) for the OUTCOME
+keep_lag_years <- Filter(function(y) {
+  vals <- d_use[d_use$year == y & d_use$unit_num %in% donor_ids, "victim_count"]
+  sum(is.finite(vals)) >= 2 && sd(vals, na.rm = TRUE) > 0
+}, pre_period)
+special_lags <- lapply(keep_lag_years, function(y) list("victim_count", y, "mean"))
+
+# Drop predictors with zero variance across donors in pre-period
+donor_means <- d_use %>%
+  dplyr::filter(year %in% pre_period, unit_num %in% donor_ids) %>%
+  dplyr::group_by(country) %>%
+  dplyr::summarise(across(all_of(predictors_vec), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+keep_predictors <- names(which(sapply(donor_means[predictors_vec], sd, na.rm = TRUE) > 0))
+if (!length(keep_predictors)) stop("No predictors with donor variance. Adjust predictors_vec.")
+
+# -----------------------------
+# 4) dataprep + synth
+# -----------------------------
+dataprep_out <- dataprep(
+  foo                  = d_use,
+  predictors           = keep_predictors,
+  predictors.op        = "mean",
+  special.predictors   = special_lags,
+  dependent            = "victim_count",     # <- outcome is victim_count only
+  unit.variable        = "unit_num",
+  unit.names.variable  = "country",
+  time.variable        = "year",
+  treatment.identifier = treated_id,
+  controls.identifier  = donor_ids,
+  time.predictors.prior= pre_period,
+  time.optimize.ssr    = pre_period,
+  time.plot            = c(pre_period, post_period)
+)
+
+synth_out <- synth(dataprep_out)
+
+path.plot(
+  synth_out, dataprep_out,
+  tr.intake = 2017,  
+  Ylab = "Victim Count",
+  Xlab = "Year",
+  Legend = c("Honduras", "Synthetic Honduras"),
+  Main = "Plot 2: Honduras vs Synthetic Control"
+)
+
+```
+```{r}
+#RMSPE pre and post fit and ratio
+# --- RMSPE pre/post & ratio -----------------------------------------------
+# Time axis and series from Synth outputs
+yrs    <- dataprep_out$tag$time.plot
+y1     <- drop(dataprep_out$Y1plot)                   # treated outcome path
+y0hat  <- drop(dataprep_out$Y0plot %*% synth_out$solution.w)  # synthetic control
+
+# Indices for pre/post using your declared periods
+pre_idx  <- yrs %in% pre_period
+post_idx <- yrs %in% post_period
+
+# Sanity check: ensure we have data in both windows
+if (!any(pre_idx))  warning("No observations in pre_period within time.plot.")
+if (!any(post_idx)) warning("No observations in post_period within time.plot.")
+
+# RMSPEs
+pre_rmspe  <- sqrt(mean((y1[pre_idx]  - y0hat[pre_idx])^2,  na.rm = TRUE))
+post_rmspe <- sqrt(mean((y1[post_idx] - y0hat[post_idx])^2, na.rm = TRUE))
+
+# Guard against divide-by-zero / NA
+r_ratio <- if (is.na(pre_rmspe) || pre_rmspe == 0) NA_real_ else post_rmspe / pre_rmspe
+
+# Optional extras for transparency
+n_pre  <- sum(pre_idx & is.finite(y1) & is.finite(y0hat))
+n_post <- sum(post_idx & is.finite(y1) & is.finite(y0hat))
+
+# --- Table -----------------------------------------------------------------
+table_rmspe <- data.frame(
+  Treated_Unit = treated_country,
+  Treat_Year   = treat_year,
+  Pre_RMSPE    = round(pre_rmspe, 3),
+  Post_RMSPE   = round(post_rmspe, 3),
+  RMSPE_Ratio  = round(r_ratio, 3),
+  N_Pre        = n_pre,
+  N_Post       = n_post
+)
+
+knitr::kable(
+  table_rmspe,
+  caption = " Pre-/Post-treatment RMSPE and Ratio for Synthetic Control"
+)
+
+```
+
+```{r}
+# =============================
+# 6) Balance table of covariates
+# =============================
+
+# Treated predictor means (rows = predictors, 1 column)
+x1_mat  <- dataprep_out$X1
+# Donor predictor means matrix (rows = predictors, cols = donors)
+x0_mat  <- dataprep_out$X0
+# Synthetic predictor means = weighted donor means
+x0_w    <- x0_mat %*% synth_out$solution.w
+
+# Also show the simple (unweighted) donor-pool average as a benchmark
+x0_avg  <- matrix(rowMeans(x0_mat), ncol = 1)
+
+# Build a tidy data frame
+balance_tbl <- data.frame(
+  Predictor = rownames(x1_mat),
+  Honduras  = drop(x1_mat),
+  Synthetic = drop(x0_w),
+  DonorMean = drop(x0_avg),
+  Gap       = drop(x1_mat) - drop(x0_w),
+  row.names = NULL,
+  check.names = FALSE
+)
+
+# Print a compact view
+kable(balance_tbl, digits = 3,
+      caption = "Predictor balance (pre-treatment): Honduras vs Synthetic control")
+
+```
+
+```{r}
+id_map <- unique(d_use[, c("unit_num","country")])
+weights_df <- merge(
+  data.frame(unit_num = donor_ids, weight = as.numeric(synth_out$solution.w)),
+  id_map, by = "unit_num", all.x = TRUE
+)
+weights_df <- subset(weights_df, weight > 0)
+weights_df <- weights_df[order(-weights_df$weight), c("country","weight")]
+
+kable(weights_df, digits = 3, col.names = c("Donor country", "Weight"),
+      caption = "Synthetic control weights (donors with positive weight)")
+ 
+
+```
+
+```{r}
+donor_sd <- apply(dataprep_out$X0, 1, sd, na.rm = TRUE)
+std_diff <- (drop(dataprep_out$X1) - drop(dataprep_out$X0 %*% synth_out$solution.w)) / donor_sd
+
+balance_std <- data.frame(
+  Predictor  = rownames(dataprep_out$X1),
+  Honduras   = drop(dataprep_out$X1),
+  Synthetic  = drop(dataprep_out$X0 %*% synth_out$solution.w),
+  DonorMean  = rowMeans(dataprep_out$X0),
+  Gap        = drop(dataprep_out$X1) - drop(dataprep_out$X0 %*% synth_out$solution.w),
+  StdDiff    = std_diff
+)
+
+#print(balance_std[order(-abs(balance_std$StdDiff)), ], row.names = FALSE, digits = 3)
+
+# --- Predictor weights (V-matrix) ---
+v_weights <- data.frame(
+  Predictor = rownames(dataprep_out$X1),
+  Weight    = as.numeric(synth_out$solution.v)
+)
+v_weights$Weight <- round(v_weights$Weight / sum(v_weights$Weight), 3)
+v_weights <- v_weights[order(-v_weights$Weight), ]
+
+kable(v_weights, digits = 3, col.names = c("Predictor", "Weight"),
+      caption = "Synthetic control weights")
+
+#Gap between the two 
+gaps.plot(
+  synth.res     = synth_out,
+  dataprep.res  = dataprep_out,
+  tr.intake     = treat_year,          # 2017
+  Ylab          = "Gap: Victim count (HND − Synthetic)",
+  Xlab          = "Year",
+  Main          = "Plot 3: Synthetic Control Gap: Honduras"
+)
+```
+
+```{r}
+yrs      <- dataprep_out$tag$time.plot
+y1       <- drop(dataprep_out$Y1)
+y0hat    <- drop(dataprep_out$Y0 %*% synth_out$solution.w)
+
+# Split pre / post
+pre_idx  <- yrs %in% pre_period
+post_idx <- yrs %in% post_period
+
+# Gaps
+gap_all  <- y1 - y0hat
+gap_post <- gap_all[post_idx]
+
+
+tableB <- data.frame(
+  Year = yrs[post_idx],
+  ATT  = round(gap_post, 2)
+)
+
+kable(
+  tableB,
+  digits = 2,
+  col.names = c("Year", "ATT (Honduras − Synthetic)"),
+  caption = "Post-treatment effects by year"
+)
+```
+
+```{r}
+# ================================
+# PLACEBO-IN-SPACE DISTRIBUTION
+# ================================
+# Choose which spec to use for the baseline (original vs cleaned):
+dp_base   <- dataprep_out     # or dataprep_out2
+synth_base<- synth_out        # or synth_out2
+
+yrs        <- dp_base$tag$time.plot
+pre_idx    <- yrs %in% pre_period
+post_idx   <- yrs %in% post_period
+donors_vec <- dp_base$tag$controls.identifier
+treated_id <- dp_base$tag$treatment.identifier
+
+# Treated (Honduras) gaps and RMSPEs
+y1    <- drop(dp_base$Y1)
+y0hat <- drop(dp_base$Y0 %*% synth_base$solution.w)
+gap_T <- y1 - y0hat
+
+pre_rmspe_T  <- sqrt(mean(gap_T[pre_idx]^2,  na.rm=TRUE))
+post_rmspe_T <- sqrt(mean(gap_T[post_idx]^2, na.rm=TRUE))
+ratio_T      <- post_rmspe_T / pre_rmspe_T
+
+# Helper to run one placebo SCM
+run_one_placebo <- function(treated_i, donors_i) {
+  dp <- dataprep(
+    foo                  = d_use,
+    predictors           = dp_base$tag$predictors,         # keep same predictors
+    predictors.op        = dp_base$tag$predictors.op,
+    special.predictors   = dp_base$special.predictors,     # same lags
+    dependent            = dp_base$tag$dependent,
+    unit.variable        = dp_base$tag$unit.variable,
+    unit.names.variable  = dp_base$tag$unit.names.variable,
+    time.variable        = dp_base$tag$time.variable,
+    treatment.identifier = treated_i,
+    controls.identifier  = donors_i,
+    time.predictors.prior= pre_period,
+    time.optimize.ssr    = pre_period,
+    time.plot            = c(pre_period, post_period)
+  )
+  so <- try(synth(dp), silent=TRUE)
+  if (inherits(so, "try-error")) return(NULL)
+
+  y1i    <- drop(dp$Y1)
+  y0hati <- drop(dp$Y0 %*% so$solution.w)
+  gap_i  <- y1i - y0hati
+  yrs_i  <- dp$tag$time.plot
+
+  pre_r  <- sqrt(mean(gap_i[yrs_i %in% pre_period]^2,  na.rm=TRUE))
+  post_r <- sqrt(mean(gap_i[yrs_i %in% post_period]^2, na.rm=TRUE))
+  ratio  <- post_r / pre_r
+
+  list(gap=gap_i, yrs=yrs_i, pre_rmspe=pre_r, post_rmspe=post_r, ratio=ratio,
+       treated_id=treated_i)
+}
+
+# Run placebos: each donor becomes "treated", controls are the rest (exclude actual treated)
+placebos <- lapply(donors_vec, function(ii) run_one_placebo(ii, setdiff(donors_vec, ii)))
+ok      <- which(!vapply(placebos, is.null, logical(1)))
+placebos<- placebos[ok]
+
+# Pre-fit filter (K = 2: keep only placebos with good pre-fit relative to treated)
+K <- 2
+pre_vec        <- vapply(placebos, function(p) p$pre_rmspe, numeric(1))
+keep_mask      <- pre_vec <= (K * pre_rmspe_T)
+placebos_keep  <- placebos[keep_mask]
+
+# Exact p-value from RMSPE ratio (upper tail)
+ratio_vec_keep <- vapply(placebos_keep, function(p) p$ratio, numeric(1))
+exact_p_ratio  <- mean(ratio_vec_keep >= ratio_T)
+
+# ------- Pointwise (year-by-year) p-values (standardized gaps) -------
+# Standardize by each unit's pre-RMSPE to equalize noise scales
+std_gap_T <- gap_T / pre_rmspe_T
+
+std_gaps_placebos <- lapply(placebos_keep, function(p) {
+  p$gap / p$pre_rmspe
+})
+
+years_post <- yrs[post_idx]
+pointwise_p <- sapply(years_post, function(tt) {
+  # treated standardized gap at year tt
+  gT <- std_gap_T[yrs == tt]
+  # gather each placebo standardized gap at the same calendar year
+  gp <- vapply(std_gaps_placebos, function(g) g[yrs == tt], numeric(1))
+  mean(gp >= gT)  # upper-tail: "as large or larger than treated"
+})
+
+summary_tab <- data.frame(
+  Pre_RMSPE   = round(pre_rmspe_T, 3),
+  Post_RMSPE  = round(post_rmspe_T, 3),
+  RMSPE_Ratio = round(ratio_T, 3),
+  Placebos_Kept = length(placebos_keep),
+  Exact_p_Ratio = round(exact_p_ratio, 2)
+)
+kable(summary_tab, caption = "Randomization inference summary (ratio-based exact p)")
+
+pointwise_tab <- data.frame(
+  Year = years_post,
+  Pointwise_p = round(pointwise_p, 2)
+)
+kable(pointwise_tab, caption = "Pointwise permutation p-values (standardized gaps)")
+
+# ------- Visuals -------
+# (1) Placebo gaps overlay vs Honduras
+plot(yrs, gap_T, type="l", lwd=3, xlab="Year", ylab="Gap (HND − Synthetic)",
+     main=sprintf("Placebo-in-space gaps (K=%g). Exact p (ratio) = %.2f", K, exact_p_ratio))
+abline(h=0, lty=3); abline(v=max(pre_period)+1, lty=3)
+for (p in placebos_keep) lines(p$yrs, p$gap, col=gray(0.7, 0.7))
+lines(yrs, gap_T, lwd=3, col="blue")
+```
+
+#Robustness and re run using the backfilled data
+
+```{r}
+#--------------------------#
+# Backfill donor outcomes for 2017 - 2019 only (never Honduras and never pre_treatment)  
+# -----------------------------
+# 1) Set treatment & windows
+# -----------------------------
+treated_country <- "Honduras"
+treat_year      <- 2017
+pre_period      <- 2005:2016
+post_period     <- 2017:2022
+all_years       <- c(pre_period, post_period)
+
+# -----------------------------
+# 2) Build clean base data (impute predictors only)
+# -----------------------------
+d <- all_data_joined %>%
+  transmute(
+    country      = countryname,
+    year         = as.integer(year),
+    unit_num     = as.numeric(factor(countryname)),
+    gdp_pc       = as.numeric(gdp_pc),
+    unemp        = as.numeric(unemp),
+    urban_pop    = as.numeric(urban_pop),
+    net_mig      = as.numeric(net_mig),
+    population   = as.numeric(population),
+    homicide     = as.numeric(homicide),
+    estimate     = as.numeric(estimate),
+    victim_count = as.numeric(victim_count)   # OUTCOME
+  ) %>%
+  group_by(country) %>%
+  mutate(across(c(gdp_pc, unemp, urban_pop, net_mig, population, homicide, estimate),
+                ~ ifelse(is.na(.), mean(.x, na.rm = TRUE), .))) %>%
+  ungroup() %>%
+  as.data.frame()
+
+treated_id     <- unique(d$unit_num[d$country == treated_country])
+donor_ids      <- setdiff(unique(d$unit_num), treated_id)
+predictors_vec <- c("gdp_pc","unemp","urban_pop","net_mig","population","homicide","estimate")
+
+# Keep only years we use
+d_use <- d[d$year %in% all_years, ]
+
+# -----------------------------
+# 3) COMPLETE PANEL + SENSITIVITY IMPUTATION for donors (2017–2019)
+#    (treat donor zeros as missing if donor had positive pre-2017 victims)
+# -----------------------------
+fill_years <- 2017:2019
+
+# (i) complete panel
+d_use <- d_use %>%
+  group_by(unit_num, country) %>%
+  tidyr::complete(
+    year = all_years,
+    fill = list(
+      gdp_pc = NA_real_, unemp = NA_real_, urban_pop = NA_real_,
+      net_mig = NA_real_, population = NA_real_, homicide = NA_real_,
+      estimate = NA_real_, victim_count = NA_real_
+    )
+  ) %>%
+  ungroup()
+
+# (ii) re-impute predictors for any added rows (never touch outcome here)
+d_use <- d_use %>%
+  group_by(country) %>%
+  mutate(across(c(gdp_pc, unemp, urban_pop, net_mig, population, homicide, estimate),
+                ~ ifelse(is.na(.), mean(.x, na.rm = TRUE), .))) %>%
+  ungroup()
+
+# (iii) treat zeros as missing only for donors with positive pre-signal
+donor_has_signal <- d_use %>%
+  filter(unit_num %in% donor_ids, year %in% pre_period) %>%
+  group_by(unit_num) %>%
+  summarise(pre_pos = any(victim_count > 0, na.rm = TRUE), .groups = "drop") %>%
+  filter(pre_pos) %>% pull(unit_num)
+
+mask_zero_post <- d_use$unit_num %in% donor_has_signal &
+  d_use$year %in% fill_years &
+  !is.na(d_use$victim_count) &
+  d_use$victim_count == 0
+message("Re-coded ", sum(mask_zero_post),
+        " donor zero cells (2017–2019) to NA for sensitivity.")
+d_use$victim_count[mask_zero_post] <- NA_real_
+
+# (iv) backfill donor NAs in 2017–2019 using donor pre-trend/mean
+donor_pre <- d_use %>%
+  filter(unit_num %in% donor_ids, year %in% pre_period, is.finite(victim_count)) %>%
+  select(unit_num, year, victim_count)
+donor_pre_mean <- if (nrow(donor_pre)) mean(donor_pre$victim_count, na.rm = TRUE) else 0
+
+imputed_cells <- 0L
+for (id in donor_ids) {
+  pos_to_fill <- which(d_use$unit_num == id &
+                         d_use$year %in% fill_years &
+                         is.na(d_use$victim_count))
+  if (!length(pos_to_fill)) next
+  
+  pre_idx <- which(d_use$unit_num == id &
+                     d_use$year %in% pre_period &
+                     is.finite(d_use$victim_count))
+  
+  if (length(pre_idx) >= 3) {
+    fit   <- lm(victim_count ~ year, data = d_use[pre_idx, c("victim_count","year")])
+    preds <- predict(fit, newdata = data.frame(year = d_use$year[pos_to_fill]))
+  } else if (length(pre_idx) >= 1) {
+    preds <- rep(mean(d_use$victim_count[pre_idx], na.rm = TRUE), length(pos_to_fill))
+  } else {
+    preds <- rep(donor_pre_mean, length(pos_to_fill))
+  }
+  preds <- round(pmax(preds, 0), 0)
+  d_use$victim_count[pos_to_fill] <- preds
+  imputed_cells <- imputed_cells + length(pos_to_fill)
+}
+message("Sensitivity imputation filled ", imputed_cells, " donor cells in 2017–2019.")
+
+# coerce types for Synth
+d_use <- as.data.frame(d_use)
+d_use$unit_num <- as.numeric(d_use$unit_num)
+d_use$year     <- as.integer(d_use$year)
+d_use$country  <- as.character(d_use$country)
+
+# -----------------------------
+# 4) First Synth (to get weights), using full donor_ids
+# -----------------------------
+# pre-treatment lags to keep
+years_pre  <- sort(intersect(pre_period, unique(d_use$year)))
+donor_mask <- d_use$unit_num %in% donor_ids
+keep_lag_years <- years_pre[
+  sapply(years_pre, function(yy) {
+    vals <- as.numeric(d_use$victim_count[d_use$year == yy & donor_mask])
+    n_ok <- sum(is.finite(vals)); s <- sd(vals, na.rm = TRUE)
+    (n_ok >= 2) && is.finite(s) && (s > 0)
+  })
+]
+special_lags <- lapply(keep_lag_years, function(yy) list("victim_count", yy, "mean"))
+
+# keep predictors with variance across donors
+donor_means <- d_use %>%
+  filter(year %in% pre_period, unit_num %in% donor_ids) %>%
+  group_by(country) %>%
+  summarise(across(all_of(predictors_vec), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+keep_predictors <- names(which(sapply(donor_means[predictors_vec], sd, na.rm = TRUE) > 0))
+
+dataprep_out <- dataprep(
+  foo                  = d_use,
+  predictors           = keep_predictors,
+  predictors.op        = "mean",
+  special.predictors   = special_lags,
+  dependent            = "victim_count",
+  unit.variable        = "unit_num",
+  unit.names.variable  = "country",
+  time.variable        = "year",
+  treatment.identifier = treated_id,
+  controls.identifier  = donor_ids,
+  time.predictors.prior= pre_period,
+  time.optimize.ssr    = pre_period,
+  time.plot            = all_years
+)
+synth_out <- synth(dataprep_out)
+
+# -----------------------------
+# 5) CLEAN donors: drop any positive-weight donor with 2017–2019 zero/NA
+# -----------------------------
+id_map <- unique(d_use[, c("unit_num","country")])
+weights_df <- merge(
+  data.frame(unit_num = donor_ids, weight = as.numeric(synth_out$solution.w)),
+  id_map, by = "unit_num", all.x = TRUE
+)
+weights_pos <- subset(weights_df, weight > 0)
+
+bad_ids <- d_use %>%
+  filter(unit_num %in% weights_pos$unit_num, year %in% fill_years) %>%
+  group_by(unit_num) %>%
+  summarise(bad = any(is.na(victim_count) | victim_count == 0), .groups = "drop") %>%
+  filter(bad) %>% pull(unit_num)
+
+message("Dropping ", length(bad_ids), " positive-weight donors with zero/NA in 2017–2019.")
+donor_ids_clean <- setdiff(donor_ids, bad_ids)
+if (length(donor_ids_clean) < 2) stop("Too few donors after cleaning; relax the rule.")
+
+# Recompute lags/predictors for CLEAN donors
+donor_mask2 <- d_use$unit_num %in% donor_ids_clean
+keep_lag_years2 <- years_pre[
+  sapply(years_pre, function(yy) {
+    vals <- as.numeric(d_use$victim_count[d_use$year == yy & donor_mask2])
+    n_ok <- sum(is.finite(vals)); s <- sd(vals, na.rm = TRUE)
+    (n_ok >= 2) && is.finite(s) && (s > 0)
+  })
+]
+if (!length(keep_lag_years2)) stop("No valid pre-treatment lag years for cleaned donors.")
+special_lags2 <- lapply(keep_lag_years2, function(yy) list("victim_count", yy, "mean"))
+
+donor_means2 <- d_use %>%
+  filter(year %in% pre_period, unit_num %in% donor_ids_clean) %>%
+  group_by(country) %>%
+  summarise(across(all_of(predictors_vec), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+keep_predictors2 <- names(which(sapply(donor_means2[predictors_vec], sd, na.rm = TRUE) > 0))
+if (!length(keep_predictors2)) stop("No predictors with donor variance after cleaning.")
+
+# -----------------------------
+# 6) Re-run Synth with CLEAN donors
+# -----------------------------
+dataprep_out2 <- dataprep(
+  foo                  = d_use,
+  predictors           = keep_predictors2,
+  predictors.op        = "mean",
+  special.predictors   = special_lags2,
+  dependent            = "victim_count",
+  unit.variable        = "unit_num",
+  unit.names.variable  = "country",
+  time.variable        = "year",
+  treatment.identifier = treated_id,
+  controls.identifier  = donor_ids_clean,
+  time.predictors.prior= pre_period,
+  time.optimize.ssr    = pre_period,
+  time.plot            = all_years
+)
+synth_out2 <- synth(dataprep_out2)
+```
+
+```{r}
+d_use %>% 
+  filter(year %in% 2017:2019, unit_num %in% donor_ids) %>% 
+  select(country, year, victim_count) %>% 
+  arrange(country, year) %>% 
+  kable(digits = 0,
+        col.names = c("Country", "Year", "Victim Count"),
+        caption = "Backfilled donor victim counts (2017–2019)")
+```
+
+```{r}
+id_map <- unique(d_use[, c("unit_num","country")])
+weights_df <- merge(
+  data.frame(unit_num = donor_ids_clean, weight = as.numeric(synth_out2$solution.w)),
+  id_map, by = "unit_num", all.x = TRUE
+)
+weights_df <- subset(weights_df, weight > 0)
+weights_df <- weights_df[order(-weights_df$weight), c("country","weight")]
+
+kable(weights_df, digits = 3, col.names = c("Donor country", "Weight"),
+      caption = "Synthetic control weights (donors with positive weight)")
+```
+
+```{r}
+# -----------------------------
+# 7) Plots
+# -----------------------------
+# Path with cleaned donors
+path.plot(
+  synth_out2, dataprep_out2,
+  tr.intake = treat_year,
+  Ylab = "Victim Count",
+  Xlab = "Year",
+  Legend = c("Honduras","Synthetic (clean donors)"),
+  Main = "Plot 5: Honduras vs backfilled synthetic"
+)
+
+
+```
+
+```{r}
+# Gap
+yrs    <- dataprep_out2$tag$time.plot
+y1     <- drop(dataprep_out2$Y1)
+y0hat2 <- drop(dataprep_out2$Y0 %*% synth_out2$solution.w)
+gap2   <- y1 - y0hat2
+plot(yrs, gap2, type="l", lwd=2, xlab="Year",
+     ylab="Gap: HND − Synthetic (clean donors)",
+     main="Gap (clean donors)")
+abline(h=0, lty=3); abline(v=treat_year, lty=3)
+
+# Optional: show which donors remained and their weights
+weights_clean <- data.frame(
+  unit_num = donor_ids_clean,
+  Weight = as.numeric(synth_out2$solution.w)
+)
+
+# Merge with id_map to get country names
+weights_clean <- merge(weights_clean, id_map, by = "unit_num", all.x = TRUE)
+
+# Keep only relevant columns: donor country + weight
+weights_clean <- weights_clean %>%
+  select(country, Weight) %>%
+  arrange(desc(Weight))
+
+# Pretty table
+kable(
+  weights_clean,
+  digits = 3,
+  col.names = c("Donor country", "Weight"),
+  caption = "Synthetic control weights (donors with positive weight)"
+)
+
+```
+
+```{r}
+# Gap
+yrs    <- dataprep_out2$tag$time.plot
+y1     <- drop(dataprep_out2$Y1)
+y0hat2 <- drop(dataprep_out2$Y0 %*% synth_out2$solution.w)
+gap2   <- y1 - y0hat2
+plot(yrs, gap2, type="l", lwd=2, xlab="Year",
+     ylab="Gap: HND − Synthetic (backfilled)",
+     main="Plot 6: Gap for backfilled donors")
+abline(h=0, lty=3); abline(v=treat_year, lty=3)
+
+# Optional: show which donors remained and their weights
+weights_clean <- data.frame(
+  unit_num = donor_ids_clean,
+  Weight = as.numeric(synth_out2$solution.w)
+)
+
+# Merge with id_map to get country names
+weights_clean <- merge(weights_clean, id_map, by = "unit_num", all.x = TRUE)
+
+# Keep only relevant columns: donor country + weight
+weights_clean <- weights_clean %>%
+  select(country, Weight) %>%
+  arrange(desc(Weight))
+
+
+kable(
+  weights_clean,
+  digits = 3,
+  col.names = c("Donor country", "Weight"),
+  caption = "Synthetic control weights (backfilled donors)"
+)
+```
+```{r}
+# Treated predictor means (rows = predictors, 1 column)
+x1_mat  <- dataprep_out2$X1
+# Donor predictor means matrix (rows = predictors, cols = donors)
+x0_mat  <- dataprep_out2$X0
+# Synthetic predictor means = weighted donor means
+x0_w    <- x0_mat %*% synth_out$solution.w
+
+# Also show the simple (unweighted) donor-pool average as a benchmark
+x0_avg  <- matrix(rowMeans(x0_mat), ncol = 1)
+
+# Build a tidy data frame
+balance_tbl <- data.frame(
+  Predictor = rownames(x1_mat),
+  Honduras  = drop(x1_mat),
+  Synthetic = drop(x0_w),
+  DonorMean = drop(x0_avg),
+  Gap       = drop(x1_mat) - drop(x0_w),
+  row.names = NULL,
+  check.names = FALSE
+)
+
+
+kable(balance_tbl, digits = 3,
+      caption = "Predictor balance (pre-treatment): Honduras vs Synthetic control")
+```
+
+
+```{r}
+# POST-TREATMENT TABLES
+# Uses objects from your script:
+# dataprep_out2, synth_out2, pre_period, post_period, treat_year
+
+yrs      <- dataprep_out2$tag$time.plot
+y1       <- drop(dataprep_out2$Y1)
+y0hat    <- drop(dataprep_out2$Y0 %*% synth_out2$solution.w)
+
+# Split pre / post
+pre_idx  <- yrs %in% pre_period
+post_idx <- yrs %in% post_period
+
+# Gaps
+gap_all  <- y1 - y0hat
+gap_post <- gap_all[post_idx]
+
+
+tableA <- data.frame(
+  Year = yrs[post_idx],
+  ATT  = round(gap_post, 2)
+)
+
+# If you later compute pointwise permutation p-values, add them here:
+# tableA$Perm_p <- pointwise_pvals_vector[match(tableA$Year, years_vector)]
+# --- Table B: Summary (RMSPE, ratio, and (optional) exact p) ---
+
+# Root mean squared prediction error pre/post
+pre_rmspe  <- sqrt(mean((y1[pre_idx]  - y0hat[pre_idx])^2,  na.rm = TRUE))
+post_rmspe <- sqrt(mean((y1[post_idx] - y0hat[post_idx])^2, na.rm = TRUE))
+r_ratio    <- post_rmspe / pre_rmspe
+
+# If you have placebo results, plug in here; otherwise leave NA
+exact_p           <- NA_real_  # replace once you compute via placebos
+n_valid_placebos  <- NA_integer_
+
+tableB <- data.frame(
+  Pre_RMSPE   = round(pre_rmspe, 3),
+  Post_RMSPE  = round(post_rmspe, 3),
+  RMSPE_Ratio = round(r_ratio, 3)
+)
+
+kable(
+  tableB,
+  caption = "Summary of post-treatment fit, RMSPE ratio, and randomization inference"
+)
+```
+
+
+```{r}
+
+# POST-TREATMENT TABLES
+# Uses objects from your script:
+# dataprep_out2, synth_out2, pre_period, post_period, treat_year
+# -----------------------------
+
+yrs      <- dataprep_out$tag$time.plot
+y1       <- drop(dataprep_out$Y1)
+y0hat    <- drop(dataprep_out$Y0 %*% synth_out$solution.w)
+
+# Split pre / post
+pre_idx  <- yrs %in% pre_period
+post_idx <- yrs %in% post_period
+
+# Gaps
+gap_all  <- y1 - y0hat
+gap_post <- gap_all[post_idx]
+
+
+tableA <- data.frame(
+  Year = yrs[post_idx],
+  ATT  = round(gap_post, 2)
+)
+
+# If you later compute pointwise permutation p-values, add them here:
+# tableA$Perm_p <- pointwise_pvals_vector[match(tableA$Year, years_vector)]
+
+kable(
+  tableA,
+  digits = 2,
+  col.names = c("Year", "ATT (Honduras − Synthetic)"),
+  caption = "Post-treatment effects by year"
+)
+```
+
+
+
+# Robustness test for LLO
+```{r}
+# ---- Leave-One-Out Test ----
+
+yrs   <- dataprep_out2$tag$time.plot
+y1    <- drop(dataprep_out2$Y1)
+y0hat <- drop(dataprep_out2$Y0 %*% synth_out2$solution.w)
+gap   <- y1 - y0hat
+
+# Positive-weight donors
+weights_clean <- data.frame(
+  unit_num = dataprep_out2$tag$controls.identifier,
+  Weight   = as.numeric(synth_out2$solution.w)
+)
+id_map <- unique(d_use[, c("unit_num","country")])
+weights_clean <- merge(weights_clean, id_map, by="unit_num", all.x=TRUE)
+pos_donors <- weights_clean$unit_num[weights_clean$Weight > 0]
+
+# Helper: run SCM with one donor dropped
+run_loo <- function(drop_id) {
+  donors_new <- setdiff(dataprep_out2$tag$controls.identifier, drop_id)
+  dp <- dataprep(
+    foo = d_use,
+    predictors = dataprep_out2$tag$predictors,
+    predictors.op = "mean",
+    special.predictors = dataprep_out2$special.predictors,
+    dependent = "victim_count",
+    unit.variable = "unit_num",
+    unit.names.variable = "country",
+    time.variable = "year",
+    treatment.identifier = dataprep_out2$tag$treatment.identifier,
+    controls.identifier = donors_new,
+    time.predictors.prior = pre_period,
+    time.optimize.ssr = pre_period,
+    time.plot = c(pre_period, post_period)
+  )
+  so <- synth(dp)
+  gap_new <- drop(dp$Y1) - drop(dp$Y0 %*% so$solution.w)
+  list(yrs=dp$tag$time.plot, gap=gap_new)
+}
+
+# Run LOO for each positive-weight donor
+loo_results <- lapply(pos_donors, run_loo)
+
+# Plot
+plot(yrs, gap, type="n", xlab="Year", ylab="Gap: Honduras - Synthetic",
+     main="Plot 7: Leave-One-Out Robustness Test")
+abline(h=0, lty=3); abline(v=treat_year, lty=3)
+for (loo in loo_results) lines(loo$yrs, loo$gap, col=gray(0.7,0.6))
+lines(yrs, gap, col="blue", lwd=2)  # baseline
+legend("topleft", legend=c("Baseline Honduras","LOO gaps"),
+       col=c("blue", "grey"), lty=1, lwd=c(2,1), bty="n")
+
+# ---- Collect LOO RMSPE stats ----
+
+get_rmspe <- function(dp, so) {
+  yrs <- dp$tag$time.plot
+  gap <- drop(dp$Y1) - drop(dp$Y0 %*% so$solution.w)
+  pre_rmspe  <- sqrt(mean(gap[yrs %in% pre_period]^2,  na.rm=TRUE))
+  post_rmspe <- sqrt(mean(gap[yrs %in% post_period]^2, na.rm=TRUE))
+  c(pre=pre_rmspe, post=post_rmspe, ratio=post_rmspe/pre_rmspe)
+}
+
+# Baseline Honduras stats
+base_stats <- get_rmspe(dataprep_out2, synth_out2)
+
+# Loop over positive-weight donors
+loo_stats <- lapply(pos_donors, function(drop_id) {
+  donors_new <- setdiff(dataprep_out2$tag$controls.identifier, drop_id)
+  dp <- dataprep(
+    foo = d_use,
+    predictors = dataprep_out2$tag$predictors,
+    predictors.op = "mean",
+    special.predictors = dataprep_out2$special.predictors,
+    dependent = "victim_count",
+    unit.variable = "unit_num",
+    unit.names.variable = "country",
+    time.variable = "year",
+    treatment.identifier = dataprep_out2$tag$treatment.identifier,
+    controls.identifier = donors_new,
+    time.predictors.prior = pre_period,
+    time.optimize.ssr = pre_period,
+    time.plot = c(pre_period, post_period)
+  )
+  so <- synth(dp)
+  stats <- get_rmspe(dp, so)
+  data.frame(Dropped= id_map$country[id_map$unit_num==drop_id],
+             Pre_RMSPE= round(stats["pre"],3),
+             Post_RMSPE= round(stats["post"],3),
+             Ratio= round(stats["ratio"],3))
+})
+
+loo_table <- do.call(rbind, loo_stats)
+
+
+
+```
+\newpage
+```{r}
+# Add baseline at top
+baseline_row <- data.frame(Dropped="None (baseline)",
+                           Pre_RMSPE= round(base_stats["pre"],3),
+                           Post_RMSPE= round(base_stats["post"],3),
+                           Ratio= round(base_stats["ratio"],3))
+loo_table <- rbind(baseline_row, loo_table)
+
+kable(loo_table,
+      caption="Leave-one-out RMSPE diagnostics: effect of dropping each positive-weight donor")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
