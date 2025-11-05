@@ -33,14 +33,13 @@ Randomisation inference and robustness checks indicate no statistically signific
 # 📂 Repository Structure
 ```
 📁 thesis-honduras-trafficking/
-│
-├──  PDF of the Thesis 
-├──  README.md                # Project documentation 
-├──  thesis_summary.pdf       # Executive summary or published version
-├──  data/                    # Raw and cleaned data files
-├──  scripts/                 # R scripts for SCM, preprocessing, and visualizations
-├──  references/              # Citation materials
-└──  results/                 # Model 
+│ 
+├──  README.md                            # Project documentation 
+├──  MSc_thesis_submission_2025.pdf       # Executive summary or published version
+├──  data/                                # Raw and cleaned data files
+├──  scripts/                             # R scripts for SCM, preprocessing, and visualizations
+├──  references/                          # Citation materials
+└──  results/                             # Model 
 
 ```
 
